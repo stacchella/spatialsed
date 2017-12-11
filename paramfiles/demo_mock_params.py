@@ -1,9 +1,10 @@
 from copy import deepcopy
 import numpy as np
-from prospect.models import priors, sedmodel
-from prospect.sources import CSPSpecBasis
 
-from sedpy.observate import load_filters
+from astropy.cosmology import WMAP9 as cosmo
+
+from prospect.models import priors, sedmodel
+from sedpy.observate import load_filters, getSED
 
 tophat = None
 
@@ -109,12 +110,173 @@ def load_obs(snr=10.0, add_noise=True, **kwargs):
     return mock
 
 # --------------
+# New Source and Model Objects
+# --------------
+
+from prospect.sources import CSPSpecBasis
+from prospect.models.sedmodel import SedModel
+from prospect.sources.constants import lightspeed, jansky_cgs, to_cgs_at_10pc
+to_cgs = to_cgs_at_10pc
+
+class SpatialSource(CSPSpecBasis):
+
+    def get_galaxy_spectrum(self, **params):
+        """Update parameters, then loop over each component getting a spectrum
+        for each.  Return all the component spectra, plus the sum
+
+        :param params:
+            A parameter dictionary that gets passed to the ``self.update``
+            method and will generally include physical parameters that control
+            the stellar population and output spectrum or SED.
+
+        :returns wave:
+            Wavelength in angstroms.
+
+        :returns spectrum:
+            Spectrum in units of Lsun/Hz/solar masses formed.  ndarray of
+            shape(ncomponent+1, nwave)
+
+        :returns mass_fraction:
+            Fraction of the formed stellar mass that still exists.
+        """
+        self.update(**params)
+        spectra = []
+        mass = np.atleast_1d(self.params['mass']).copy()
+        mfrac = np.zeros_like(mass)
+        # Loop over mass components
+        for i, m in enumerate(mass):
+            self.update_component(i)
+            wave, spec = self.ssp.get_spectrum(tage=self.ssp.params['tage'],
+                                               peraa=False)
+            spectra.append(spec)
+            mfrac[i] = (self.ssp.stellar_mass)
+
+        # Convert normalization units from per stellar mass to per mass formed
+        if np.all(self.params.get('mass_units', 'mformed') == 'mstar'):
+            mass /= mfrac
+        spectrum = np.dot(mass, np.array(spectra)) / mass.sum()
+        mfrac_sum = np.dot(mass, mfrac) / mass.sum()
+
+        return wave, np.squeeze(spectra + [spectrum]), np.squeeze(mfrac.tolist() + [mfrac_sum])
+
+    def get_spectrum(self, outwave=None, filters=None, component=-1, **params):
+        """
+        """
+        # Spectrum in Lsun/Hz per solar mass formed, restframe
+        wave, spectrum, mfrac = self.get_galaxy_spectrum(**params)
+
+        # Redshifting + Wavelength solution
+        # We do it ourselves.
+        a = 1 + self.params.get('zred', 0)
+        af = a
+        b = 0.0
+
+        if 'wavecal_coeffs' in self.params:
+            x = wave - wave.min()
+            x = 2.0 * (x / x.max()) - 1.0
+            c = np.insert(self.params['wavecal_coeffs'], 0, 0)
+            # assume coeeficients give shifts in km/s
+            b = chebval(x, c) / (lightspeed*1e-13)
+
+        wa, sa = wave * (a + b), spectrum * af  # Observed Frame
+        if outwave is None:
+            outwave = wa
+
+        # Observed frame photometry, as absolute maggies
+        if filters is not None:
+            # Magic to only do filter projections for unique filters, and get a
+            # mapping back into this list of unique filters
+            # note that this may scramble order of unique_filters
+            fnames = [f.name for f in filters]
+            unique_names, uinds, filter_ind = np.unique(fnames, return_index=True, return_inverse=True)
+            unique_filters = np.array(filters)[uinds]
+            mags = getSED(wa, lightspeed/wa**2 * sa * to_cgs, unique_filters)
+            phot = np.atleast_1d(10**(-0.4 * mags))
+        else:
+            phot = 0.0
+
+        # Distance dimming and unit conversion
+        zred = self.params.get('zred', 0.0)
+        if (zred == 0) or ('lumdist' in self.params):
+            # Use 10pc for the luminosity distance (or a number
+            # provided in the dist key in units of Mpc)
+            dfactor = (self.params.get('lumdist', 1e-5) * 1e5)**2
+        else:
+            lumdist = cosmo.luminosity_distance(zred).value
+            dfactor = (lumdist * 1e5)**2
+
+        # Spectrum will be in maggies
+        sa *= to_cgs / dfactor / (3631*jansky_cgs)
+
+        # Convert from absolute maggies to apparent maggies
+        phot /= dfactor
+
+        # Mass normalization
+        mass = np.atleast_1d(self.params['mass'])
+        mass = np.squeeze(mass.tolist() + [mass.sum()])
+
+        sa = (sa * mass[:, None])
+        phot = (phot * mass[:, None])[component, filter_ind]
+
+        return sa[-1, :], phot, mfrac
+
+
+class SpatialSedModel(SedModel):
+
+    def sed(self, theta, obs, sps=None, **kwargs):
+        """Given a theta vector, generate a spectrum, photometry, and any
+        extras (e.g. stellar mass), ***not** including any instrument
+        calibration effects.
+
+        :param theta:
+            ndarray of parameter values.
+
+        :param sps:
+            A StellarPopBasis object to be used
+            in the model generation.
+
+        :returns spec:
+            The model spectrum for these parameters, at the wavelengths
+            specified by obs['wavelength'], in linear units.
+
+        :returns phot:
+            The model photometry for these parameters, for the filters
+            specified in obs['filters'].
+
+        :returns extras:
+            Any extra aspects of the model that are returned.
+        """
+
+        self.set_parameters(theta)
+        spec, phot, extras = sps.get_spectrum(outwave=obs['wavelength'],
+                                              filters=obs['filters'],
+                                              component=obs.get('component', -1),
+                                              lnwavegrid=obs.get('lnwavegrid', None),
+                                              **self.params)
+
+        spec *= obs.get('normalization_guess', 1.0)
+        # Remove negative fluxes.
+        try:
+            tiny = 1.0/len(spec) * spec[spec > 0].min()
+            spec[spec < tiny] = tiny
+        except:
+            pass
+        spec = (spec + self.sky())
+        self._spec = spec.copy()
+        return spec, phot, extras
+
+    def spec_calibration(self, **extras):
+        return 1.0
+
+    
+# --------------
 # SPS Object
 # --------------
 
+
 def load_sps(zcontinuous=1, compute_vega_mags=False, **extras):
-    sps = CSPSpecBasis(zcontinuous=zcontinuous,
-                       compute_vega_mags=compute_vega_mags)
+    sps = SpatialSource(zcontinuous=zcontinuous,
+                        compute_vega_mags=compute_vega_mags)
     return sps
 
 # -----------------
@@ -192,32 +354,6 @@ model_params.append({'name': 'tage', 'N': 1,
                         'units': 'Gyr',
                         'prior': priors.TopHat(mini=0.101, maxi=14.0)})
 
-model_params.append({'name': 'fage_burst', 'N': 1,
-                        'isfree': False,
-                        'init': 0.0,
-                        'units': 'time at wich burst happens, as a fraction of `tage`',
-                        'prior': priors.TopHat(mini=0.9, maxi=1.0)})
-
-# This function transfroms from a fractional age of a burst to an absolute age.
-# With this transformation one can sample in ``fage_burst`` without worry about
-# the case tburst > tage.
-def tburst_fage(tage=0.0, fage_burst=0.0, **extras):
-    return tage * fage_burst
-
-# FSPS parameter
-model_params.append({'name': 'tburst', 'N': 1,
-                        'isfree': False,
-                        'init': 0.0,
-                        'units': '',
-                        'prior': None,})
-                        #'depends_on': tburst_fage})  # uncomment if using bursts.
-
-# FSPS parameter
-model_params.append({'name': 'fburst', 'N': 1,
-                        'isfree': False,
-                        'init': 0.0,
-                        'units': '',
-                        'prior': priors.TopHat(mini=0.0, maxi=0.5)})
 
 # --- Dust ---------
 # FSPS parameter
@@ -228,20 +364,6 @@ model_params.append({'name': 'dust2', 'N': 1,
                         'init_disp': 0.3,
                         'units': 'Diffuse dust optical depth towards all stars at 5500AA',
                         'prior': priors.TopHat(mini=0.0, maxi=2.0)})
-
-# FSPS parameter
-model_params.append({'name': 'dust1', 'N': 1,
-                        'isfree': False,
-                        'init': 0.0,
-                        'units': 'Extra optical depth towards young stars at 5500AA',
-                        'prior': None,})
-
-# FSPS parameter
-model_params.append({'name': 'dust_tesc', 'N': 1,
-                        'isfree': False,
-                        'init': 7.0,
-                        'units': 'definition of young stars for the purposes of the CF00 dust model, log(Gyr)',
-                        'prior': None,})
 
 # FSPS parameter
 model_params.append({'name': 'dust_index', 'N': 1,
@@ -278,29 +400,12 @@ model_params.append({'name': 'duste_umin', 'N': 1,
                         'units': 'MMP83 local MW intensity',
                         'prior': None})
 
-# --- Stellar Pops ------------
-# One could imagine changing these, though doing so *during* the fitting will
-# be dramatically slower.
-# FSPS parameter
-model_params.append({'name': 'tpagb_norm_type', 'N': 1,
+model_params.append({'name': 'duste_qpah', 'N': 1,
                         'isfree': False,
-                        'init': 2,
-                        'units': 'index',
+                        'init': 2.0,
+                        'units': 'MMP83 local MW intensity',
                         'prior': None})
 
-# FSPS parameter
-model_params.append({'name': 'add_agb_dust_model', 'N': 1,
-                        'isfree': False,
-                        'init': True,
-                        'units': 'index',
-                        'prior': None})
-
-# FSPS parameter
-model_params.append({'name': 'agb_dust', 'N': 1,
-                        'isfree': False,
-                        'init': 1,
-                        'units': 'index',
-                        'prior': None})
 
 # --- Nebular Emission ------
 
@@ -346,6 +451,7 @@ model_params.append({'name': 'phot_jitter', 'N': 1,
                         'units': 'mags',
                         'prior': priors.TopHat(mini=0.0, maxi=0.2)})
 
+
 def load_model(zred=0.0, **extras):
     # In principle (and we've done it) you could have the model depend on
     # command line arguments (or anything in run_params) by making changes to
@@ -358,5 +464,5 @@ def load_model(zred=0.0, **extras):
     zind = pn.index('zred')
     model_params[zind]['init'] = zred
     
-    return sedmodel.SedModel(model_params)
+    return SpatialSedModel(model_params)
 
