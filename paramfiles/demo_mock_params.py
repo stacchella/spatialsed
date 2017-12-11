@@ -1,9 +1,8 @@
 from copy import deepcopy
 import numpy as np
-
-from astropy.cosmology import WMAP9 as cosmo
-
+import os
 from prospect.models import priors, sedmodel
+from astropy.cosmology import WMAP9 as cosmo
 from sedpy.observate import load_filters, getSED
 
 tophat = None
@@ -11,33 +10,27 @@ tophat = None
 # --------------
 # RUN_PARAMS
 # --------------
-
 run_params = {'verbose':True,
               'debug':False,
-              'outfile':'output/demo_mock',
-              # Optimization parameters
-              'do_powell': False,
-              'ftol':0.5e-5, 'maxfev':5000,
-              'initial_disp':0.1,
-              'do_levenburg': True,
-              'nmin': 10,
-              # emcee Fitter parameters
-              'nwalkers':128,
-              'nburn':[32, 32, 64], 'niter':512,
-              # nestle Fitter parameters
-              'nestle_method': 'single',
-              'nestle_npoints': 200,
-              'nestle_maxcall': int(1e6),
+              'outfile':'spatial_demo',
+              # dynesty params
+              'nested_bound': 'multi', # bounding method
+              'nested_sample': 'rwalk', # sampling method
+              'nested_walks': 30, # MC walks
+              'nested_nlive_batch': 200, # size of live point "batches"
+              'nested_nlive_init': 200, # number of initial live points
+              'nested_weight_kwargs': {'pfrac': 1.0}, # weight posterior over evidence by 100%
+              'nested_dlogz_init': 0.01,
               # Mock data parameters
               'snr': 20.0,
               'add_noise': False,
               # Input mock model parameters
-              'mass': 1e10,
-              'logzsol': -0.5,
-              'tage': 12.,
-              'tau': 3.,
-              'dust2': 0.3,
-              'zred': 0.1,
+              'mass': np.array([4e10,1e10]),
+              'logzsol': np.array([0.0,-0.5]),
+              'tage': np.array([12.,4.]),
+              'tau': np.array([1.,10]),
+              'dust2': np.array([0.2,0.6]),
+              'zred': 1.,
               # Data manipulation parameters
               'logify_spectrum':False,
               'normalize_spectrum':False,
@@ -48,17 +41,6 @@ run_params = {'verbose':True,
 # --------------
 # OBS
 # --------------
-
-# Here we are going to put together some filter names
-# All these filters are available in sedpy.  If you want to use other filters,
-# add their transmission profiles to sedpy/sedpy/data/filters/ with appropriate
-# names (and format).  See sedpy documentation
-galex = ['galex_FUV', 'galex_NUV']
-sdss = ['sdss_{0}0'.format(b) for b in ['u','g','r','i','z']]
-twomass = ['twomass_{}'.format(b) for b in ['J', 'H', 'Ks']]
-spitzer = ['spitzer_irac_ch'+n for n in ['1','2','3','4']]
-
-
 def load_obs(snr=10.0, add_noise=True, **kwargs):
     """Make a mock dataset.  Feel free to add more complicated kwargs, and put
     other things in the run_params dictionary to control how the mock is
@@ -71,17 +53,35 @@ def load_obs(snr=10.0, add_noise=True, **kwargs):
     :param add_noise: (optional, boolean, default: True)
         If True, add a realization of the noise to the mock spectrum
     """
-    # We'll put the mock data in this dictionary, just as we would for real
-    # data.  But we need to know which bands (and wavelengths if doing
-    # spectroscopy) in which to generate mock data.
-    mock = {}
-    mock['wavelength'] = None # No spectrum
-    filterset = galex + sdss + twomass + spitzer[:2] # only warm spitzer
-    mock['filters'] = load_filters(filterset)
 
-    # We need the models to make a mock
+    # first, load the filters. let's use the GOODSN filter set.
+    # XX: rewrite as necessary to find the filters folder
+    filter_folder = os.getenv('APPS')+'/spatialsed/filters/'
+    fname_all = os.listdir(filter_folder)
+    fname_goodsn = [f.split('.')[0] for f in fname_all if 'goodsn' in f]
+
+    # now separate into components. we will generate separate observations for
+    # HST bands.
+    fname_hst = ['f435w','f606w','f775w','f850lp','f125w','f140w','f160w']
+    n_hst = len(fname_hst)
+    n_blended = len(fname_goodsn) - n_hst
+    component = np.array(np.zeros(n_hst).tolist() + np.ones(n_hst).tolist() + np.repeat(-1,n_blended).tolist(),dtype=int)
+
+    # generate filter list. repeat HST filters
+    fname_ground = [s for s in fname_goodsn if s.split('_')[0] not in fname_hst]
+    fnames = 2*[f+'_goodsn' for f in fname_hst] + fname_ground
+    filters = load_filters(fnames, directory=filter_folder)
+
+    # now generate data
+    # we will need the models to make a mock
     sps = load_sps(**kwargs)
     mod = load_model(**kwargs)
+
+    # we will also need an obs dictionary
+    obs = {}
+    obs['filters'] = filters
+    obs['component'] = component
+    obs['wavelength'] = None
 
     # Now we get the mock params from the kwargs dict
     params = {}
@@ -89,25 +89,44 @@ def load_obs(snr=10.0, add_noise=True, **kwargs):
         if p in kwargs:
             params[p] = np.atleast_1d(kwargs[p])
 
-    # And build the mock
+    # Generate the photometry, add noise
     mod.params.update(params)
-    spec, phot, _ = mod.mean_model(mod.theta, mock, sps=sps)
-    # Now store some output
-    mock['true_spectrum'] = spec.copy()
-    mock['true_maggies'] = phot.copy()
-    mock['mock_params'] = deepcopy(mod.params)
-    # And add noise
+    spec, phot, _ = mod.mean_model(mod.theta, obs, sps=sps)
     pnoise_sigma = phot / snr
     if add_noise:
         pnoise = np.random.normal(0, 1, len(phot)) * pnoise_sigma
-        mock['maggies'] = phot + pnoise
+        maggies = phot + pnoise
     else:
-        mock['maggies'] = phot.copy()
-    mock['maggies_unc'] = pnoise_sigma
-    mock['mock_snr'] = snr
-    mock['phot_mask'] = np.ones(len(phot), dtype=bool)
+        maggies = phot.copy()
 
-    return mock
+    # Now store output in standard format
+    obs['maggies'] = maggies
+    obs['maggies_unc'] = pnoise_sigma
+    obs['mock_snr'] = snr
+    obs['phot_mask'] = np.ones(len(phot), dtype=bool)
+
+    # we also keep the unessential mock information
+    obs['true_spectrum'] = spec.copy()
+    obs['true_maggies'] = phot.copy()
+    obs['mock_params'] = deepcopy(mod.params)
+
+    return obs
+
+    """ plotting code
+    wave_eff = np.log10([filt.wave_effective for filt in obs['filters']])
+    flux = np.log10(obs['maggies'])
+    fluxerr = np.zeros_like(flux)+0.05
+    bulge = obs['component'] == 0
+    disk = obs['component'] == 1
+    total = obs['component'] == -1
+
+    plt.errorbar(wave_eff,flux,yerr=fluxerr,color='black',linestyle=' ',label='total',fmt='o')
+    plt.errorbar(wave_eff[bulge], flux[bulge], yerr=fluxerr[bulge], color='red', linestyle=' ', fmt='o', label='bulge')
+    plt.errorbar(wave_eff[disk], flux[disk], yerr=fluxerr[disk], color='blue', linestyle=' ', fmt='o', label='disk')
+    plt.legend()
+    plt.show()
+
+    """
 
 # --------------
 # New Source and Model Objects
@@ -318,14 +337,14 @@ model_params.append({'name': 'sfh', 'N': 1,
                         'units': 'type',
                         'prior': None})
 
-model_params.append({'name': 'mass', 'N': 1,
+model_params.append({'name': 'mass', 'N': 2,
                         'isfree': True,
                         'init': 1e10,
                         'init_disp': 1e9,
                         'units': r'M_\odot',
                         'prior': priors.LogUniform(mini=1e8, maxi=1e12)})
 
-model_params.append({'name': 'logzsol', 'N': 1,
+model_params.append({'name': 'logzsol', 'N': 2,
                         'isfree': True,
                         'init': -0.3,
                         'init_disp': 0.3,
@@ -339,7 +358,7 @@ model_params.append({'name': 'pmetals', 'N': 1,
                         'prior': None})
                         
 # FSPS parameter
-model_params.append({'name': 'tau', 'N': 1,
+model_params.append({'name': 'tau', 'N': 2,
                         'isfree': True,
                         'init': 1.0,
                         'init_disp': 0.5,
@@ -347,17 +366,17 @@ model_params.append({'name': 'tau', 'N': 1,
                         'prior':priors.LogUniform(mini=0.101, maxi=100)})
 
 # FSPS parameter
-model_params.append({'name': 'tage', 'N': 1,
+model_params.append({'name': 'tage', 'N': 2,
                         'isfree': True,
                         'init': 5.0,
                         'init_disp': 3.0,
                         'units': 'Gyr',
-                        'prior': priors.TopHat(mini=0.101, maxi=14.0)})
+                        'prior': priors.TopHat(mini=0.01, maxi=14.0)})
 
 
 # --- Dust ---------
 # FSPS parameter
-model_params.append({'name': 'dust2', 'N': 1,
+model_params.append({'name': 'dust2', 'N': 2,
                         'isfree': True,
                         'init': 0.35,
                         'reinit': True,
