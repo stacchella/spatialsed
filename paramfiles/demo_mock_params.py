@@ -10,41 +10,37 @@ tophat = None
 # --------------
 # RUN_PARAMS
 # --------------
-run_params = {'verbose': True,
-              'debug': False,
-              'outfile': 'spatial_demo',
+run_params = {'verbose':True,
+              'debug':False,
+              'outfile':'spatial_demo',
               # dynesty params
-              'nested_bound': 'multi',  # bounding method
-              'nested_sample': 'rwalk',  # sampling method
-              'nested_walks': 50,  # MC walks
-              'nested_nlive_batch': 200,  # size of live point "batches"
-              'nested_nlive_init': 200,  # number of initial live points
-              'nested_weight_kwargs': {'pfrac': 1.0},  # weight posterior over evidence by 100%
+              'nested_bound': 'multi', # bounding method
+              'nested_sample': 'rwalk', # sampling method
+              'nested_walks': 30, # MC walks
+              'nested_nlive_batch': 200, # size of live point "batches"
+              'nested_nlive_init': 200, # number of initial live points
+              'nested_weight_kwargs': {'pfrac': 1.0}, # weight posterior over evidence by 100%
               'nested_dlogz_init': 0.01,
-              'nested_stop_kwargs': {'post_thresh': 0.01, 'n_mc': 50},  # higher threshold, more MCMC
               # Mock data parameters
               'snr': 20.0,
               'add_noise': False,
               # Input mock model parameters
-              'mass': np.array([4e10, 1e10]),
-              'logzsol': np.array([0.0, -0.5]),
-              'tage': np.array([12., 4.]),
-              'tau': np.array([1., 10]),
-              'dust2': np.array([0.2, 0.6]),
+              'mass': np.array([4e10,1e10]),
+              'logzsol': np.array([0.0,-0.5]),
+              'tage': np.array([12.,4.]),
+              'tau': np.array([1.,10]),
+              'dust2': np.array([0.2,0.6]),
               'zred': 1.,
               # Data manipulation parameters
-              'logify_spectrum': False,
-              'normalize_spectrum': False,
+              'logify_spectrum':False,
+              'normalize_spectrum':False,
               # SPS parameters
               'zcontinuous': 1,
-              'compute_vega_mags': False,
               }
 
 # --------------
 # OBS
 # --------------
-
-
 def load_obs(snr=10.0, add_noise=True, **kwargs):
     """Make a mock dataset.  Feel free to add more complicated kwargs, and put
     other things in the run_params dictionary to control how the mock is
@@ -60,16 +56,16 @@ def load_obs(snr=10.0, add_noise=True, **kwargs):
 
     # first, load the filters. let's use the GOODSN filter set.
     # XX: rewrite as necessary to find the filters folder
-    filter_folder = '/Users/sandrotacchella/ASTRO/Programms/spatialsed/filters/'
+    filter_folder = os.getenv('APPS')+'/spatialsed/filters/'
     fname_all = os.listdir(filter_folder)
     fname_goodsn = [f.split('.')[0] for f in fname_all if 'goodsn' in f]
 
     # now separate into components. we will generate separate observations for
     # HST bands.
-    fname_hst = ['f435w', 'f606w', 'f775w', 'f850lp', 'f125w', 'f140w', 'f160w']
+    fname_hst = ['f435w','f606w','f775w','f850lp','f125w','f140w','f160w']
     n_hst = len(fname_hst)
     n_blended = len(fname_goodsn) - n_hst
-    component = np.array(np.zeros(n_hst).tolist() + np.ones(n_hst).tolist() + np.repeat(-1, n_blended).tolist(), dtype=int)
+    component = np.array(np.zeros(n_hst).tolist() + np.ones(n_hst).tolist() + np.repeat(-1,n_blended).tolist(),dtype=int)
 
     # generate filter list. repeat HST filters
     fname_ground = [s for s in fname_goodsn if s.split('_')[0] not in fname_hst]
@@ -95,7 +91,7 @@ def load_obs(snr=10.0, add_noise=True, **kwargs):
 
     # Generate the photometry, add noise
     mod.params.update(params)
-    spec, phot, = mod.mean_model(mod.theta, obs, sps=sps)
+    spec, phot, _ = mod.mean_model(mod.theta, obs, sps=sps)
     pnoise_sigma = phot / snr
     if add_noise:
         pnoise = np.random.normal(0, 1, len(phot)) * pnoise_sigma
@@ -140,7 +136,6 @@ from prospect.sources import CSPSpecBasis
 from prospect.models.sedmodel import SedModel
 from prospect.sources.constants import lightspeed, jansky_cgs, to_cgs_at_10pc
 to_cgs = to_cgs_at_10pc
-
 
 class SpatialSource(CSPSpecBasis):
 
@@ -292,7 +287,7 @@ class SpatialSedModel(SedModel):
     def spec_calibration(self, **extras):
         return 1.0
 
-
+    
 # --------------
 # SPS Object
 # --------------
@@ -303,11 +298,9 @@ def load_sps(zcontinuous=1, compute_vega_mags=False, **extras):
                         compute_vega_mags=compute_vega_mags)
     return sps
 
-
 # -----------------
 # Noise Model
 # ------------------
-
 
 def load_gp(**extras):
     return None, None
@@ -363,14 +356,14 @@ model_params.append({'name': 'pmetals', 'N': 1,
                         'isfree': False,
                         'init': -99,
                         'prior': None})
-
+                        
 # FSPS parameter
 model_params.append({'name': 'tau', 'N': 2,
                         'isfree': True,
                         'init': 1.0,
                         'init_disp': 0.5,
                         'units': 'Gyr',
-                        'prior': priors.LogUniform(mini=0.101, maxi=100)})
+                        'prior':priors.LogUniform(mini=0.101, maxi=100)})
 
 # FSPS parameter
 model_params.append({'name': 'tage', 'N': 2,
